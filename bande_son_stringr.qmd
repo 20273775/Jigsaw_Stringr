@@ -1,0 +1,345 @@
+---
+title: "La bande sonore au propre : nettoyer une liste de lecture avec stringr"
+subtitle: "Aller plus loin dans le Tidyverse — Jigsaw Classroom"
+date: today
+lang: fr
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Introduction : contexte, problème et données
+
+### Contexte
+
+Vous animez une émission de radio étudiante et préparez un épisode spécial sur la bande sonore d'un jeu vidéo. La liste de lecture exportée depuis Spotify compte 948 titres. Avant d'écrire l'émission, vous voulez répondre à trois questions :
+
+- Combien de **chansons différentes** la liste contient-elle vraiment?
+- Quelle **époque** domine?
+- Quelle part des titres sont des **rééditions**, des **remix** ou des **collaborations**?
+
+### Problème
+
+Les titres ne sont pas propres. Une même chanson peut apparaître sous plusieurs formes (« Devil Woman » et « Devil Woman - 2001 Remaster »), les collaborations sont écrites de plusieurs façons (« feat. », « ft. », « with », « Featuring »), certains titres sont entièrement en majuscules, et certains contiennent des caractères invisibles ou des espaces superflus. Compter les lignes ne répond donc à aucune des questions : il faut d'abord travailler le **texte** des titres.
+
+### Données
+
+Le fichier `data/My_Spotify_Library_messy.csv` est une version **désordonnée** de l'export Spotify. Elle a été générée à partir de `data/My Spotify Library.csv` en ajoutant, de façon aléatoire, les problèmes décrits ci-dessus (majuscules, collaborations variées, suffixes de version, caractères invisibles, espaces, casse des artistes) et 25 doublons avec de légères variantes. Le code de génération est présenté ci-dessous, sans être réexécuté au moment du rendu.
+
+```{r}
+#| label: generation-fichier
+#| eval: false
+set.seed(7394)
+zw <- intToUtf8(8203)
+original <- read_csv("data/My Spotify Library.csv", show_col_types = FALSE)
+n <- nrow(original)
+
+titre <- original$`Track name`
+artiste <- original$`Artist name`
+feat_artist <- sample(artiste, n, TRUE)
+
+pick <- runif(n) < 0.05
+titre[pick] <- str_to_upper(titre[pick])
+pick <- runif(n) < 0.10
+mots <- sample(c("feat.", "ft.", "Featuring", "with"), n, TRUE)
+titre[pick] <- paste0(titre[pick], " (", mots[pick], " ", feat_artist[pick], ")")
+pick <- runif(n) < 0.08
+suffixes <- sample(c(" - 2015 Remaster", " - Remix", " - Edit", " (2011 Remaster)"), n, TRUE)
+titre[pick] <- paste0(titre[pick], suffixes[pick])
+pick <- runif(n) < 0.05
+titre[pick] <- paste0(titre[pick], zw)
+pick <- runif(n) < 0.05
+titre[pick] <- paste0("  ", titre[pick], " ")
+
+artiste_messy <- artiste
+pick <- runif(n) < 0.04
+artiste_messy[pick] <- str_to_lower(artiste_messy[pick])
+pick <- runif(n) < 0.03
+artiste_messy[pick] <- paste0(artiste_messy[pick], " ")
+
+messy <- original |>
+  mutate(`Track name` = titre, `Artist name` = artiste_messy)
+
+dups <- messy |>
+  slice_sample(n = 25) |>
+  mutate(`Track name` = paste0(`Track name`, if_else(runif(25) < 0.5, zw, " ")))
+
+messy <- bind_rows(messy, dups) |>
+  slice_sample(prop = 1)
+
+write_csv(messy, "data/My_Spotify_Library_messy.csv")
+```
+
+```{r}
+#| label: chargement
+library(tidyverse)
+library(knitr)
+
+brut <- read_csv("data/My_Spotify_Library_messy.csv", show_col_types = FALSE) |>
+  select(titre = `Track name`, artiste = `Artist name`, album = Album, isrc = ISRC)
+
+nrow(brut)
+```
+
+Un premier coup d'œil à deux artistes montre le problème :
+
+```{r}
+#| label: apercu-brut
+brut |>
+  filter(str_detect(artiste, regex("cliff|madonna", ignore_case = TRUE))) |>
+  arrange(artiste, titre) |>
+  head(8) |>
+  kable()
+```
+
+## 2. Démarche : quatre fonctions de stringr
+
+Le nettoyage se fait en étapes. Les quatre fonctions principales sont `str_replace_all()`, `str_detect()`, `str_extract()` et `str_to_title()`. Quelques fonctions auxiliaires du même paquetage (`str_squish()`, `str_remove()`, `str_to_lower()`, `str_c()`) complètent le travail.
+
+### Fonction 1 : `str_replace_all()`, nettoyer les titres
+
+**Ce qu'elle fait.** Remplace toutes les occurrences d'un motif (expression régulière) dans un texte. Avec `""` comme remplacement, elle supprime ce que le motif trouve.
+
+**Arguments essentiels.** `string` : le texte à modifier; `pattern` : le motif à repérer; `replacement` : le texte de remplacement (ici vide).
+
+**Effet concret.** Elle retire les caractères invisibles, les collaborations entre parenthèses, les crochets, les suffixes après un tiret et les mentions de version. On obtient un `titre_base` qui identifie la chanson.
+
+**Pourquoi à cette étape.** Sans titre de base, on ne peut ni compter les chansons distinctes ni repérer les doublons. Les remplacements s'enchaînent avec `|>`, un par type de « bruit ».
+
+```{r}
+#| label: fonction-1
+invisibles <- "[\\u200b\\u200c\\u200d\\ufeff]"
+
+etape1 <- brut |>
+  mutate(
+    titre_net = titre |>
+      str_replace_all(invisibles, "") |>
+      str_squish(),
+    titre_base = titre_net |>
+      # Collaborations entre parenthèses ou crochets
+      str_replace_all("(?i)\\s*[\\(\\[]\\s*(feat|ft|featuring|with)\\b[^\\)\\]]*[\\)\\]]", "") |>
+      # Autres crochets
+      str_replace_all("\\s*\\[[^\\]]*\\]", "") |>
+      # Suffixe après un tiret
+      str_replace_all("\\s+-\\s+.*$", "") |>
+      # Parenthèses de version
+      str_replace_all("(?i)\\s*\\([^\\)]*(remaster|remix|edit|version)[^\\)]*\\)", "") |>
+      str_squish()
+  )
+
+etape1 |>
+  filter(titre != titre_net | titre_net != titre_base) |>
+  select(titre, titre_base) |>
+  slice_head(n = 8) |>
+  kable()
+```
+
+Les caractères invisibles ne se voient pas à l'écran. On peut les compter avant et après nettoyage :
+
+```{r}
+#| label: controle-invisibles
+tibble(
+  etape = c("Avant", "Après"),
+  titres_avec_invisibles = c(
+    sum(str_detect(brut$titre, invisibles)),
+    sum(str_detect(etape1$titre_net, invisibles))
+  )
+) |>
+  kable()
+```
+
+### Fonction 2 : `str_detect()`, repérer les versions et les collaborations
+
+**Ce qu'elle fait.** Teste si un motif est présent dans chaque chaîne et renvoie `TRUE` ou `FALSE`.
+
+**Arguments essentiels.** `string` : le vecteur à tester; `pattern` : le motif. `regex("...", ignore_case = TRUE)` permet d'ignorer la casse, ce qui est utile puisque certains titres sont en majuscules.
+
+**Effet concret.** On ajoute trois colonnes logiques (`est_remaster`, `est_remix`, `est_collab`) qui servent à compter et à filtrer.
+
+**Pourquoi à cette étape.** Les titres sont maintenant sans caractères invisibles, donc les motifs fonctionnent. On travaille sur `titre_net` : l'information recherchée (« Remaster », « feat. ») est justement retirée du titre de base.
+
+```{r}
+#| label: fonction-2
+motif_collab <- "(?i)(\\(|\\[|- )\\s*(feat|ft|featuring|with)\\b\\.?\\s+"
+
+etape2 <- etape1 |>
+  mutate(
+    est_remaster = str_detect(titre_net, regex("remaster", ignore_case = TRUE)),
+    est_remix = str_detect(titre_net, regex("remix", ignore_case = TRUE)),
+    est_collab = str_detect(titre_net, motif_collab)
+  )
+
+etape2 |>
+  summarise(
+    lignes = n(),
+    remasters = sum(est_remaster),
+    remix = sum(est_remix),
+    collaborations = sum(est_collab)
+  ) |>
+  kable()
+```
+
+### Fonction 3 : `str_extract()`, extraire l'information utile
+
+**Ce qu'elle fait.** Extrait la première partie du texte qui correspond au motif, ou renvoie `NA` s'il n'y en a pas.
+
+**Arguments essentiels.** `string` et `pattern`. Le motif peut utiliser un lookahead, comme `(?= Remaster)`, qui vérifie la présence d'un texte sans l'inclure dans le résultat.
+
+**Effet concret.** On crée trois colonnes : `invite` (l'artiste invité), `annee_remaster` (l'année de la réédition) et `decennie` (l'époque estimée à partir de l'ISRC).
+
+**Pourquoi à cette étape.** Le nettoyage et la détection sont faits; il reste à récupérer l'information. Pour l'époque, l'ISRC contient deux chiffres d'année (positions 6 et 7 après le code pays et le code d'enregistreur). Les codes sont convertis en majuscules avant l'extraction pour ne perdre aucune ligne.
+
+```{r}
+#| label: fonction-3
+etape3 <- etape2 |>
+  mutate(
+    invite = titre_net |>
+      str_extract(str_c(motif_collab, "[^\\)\\]]+")) |>
+      str_remove(motif_collab),
+    annee_remaster = str_extract(titre_net, "\\d{4}(?= Remaster)") |>
+      as.integer(),
+    annee_isrc = isrc |>
+      str_to_upper() |>
+      str_extract("^[A-Z]{2}[A-Z0-9]{3}\\d{2}") |>
+      str_sub(-2) |>
+      as.integer(),
+    annee_isrc = if_else(annee_isrc <= 26, 2000 + annee_isrc, 1900 + annee_isrc),
+    decennie = str_c(annee_isrc %/% 10 * 10, "s")
+  )
+
+etape3 |>
+  filter(!is.na(invite)) |>
+  select(titre_net, invite) |>
+  slice_head(n = 6) |>
+  kable()
+```
+
+L'année de l'ISRC est celle de l'attribution du code, pas toujours celle de la sortie : c'est une estimation. Les années 00 à 26 sont lues comme 2000 à 2026, les autres comme 1900 à 1999.
+
+### Fonction 4 : `str_to_title()`, uniformiser la casse
+
+**Ce qu'elle fait.** Met en majuscule la première lettre de chaque mot et met le reste en minuscules.
+
+**Arguments essentiels.** `string` seulement.
+
+**Effet concret.** `"MOJABI GHOST"` devient `"Mojabi Ghost"`.
+
+**Pourquoi à cette étape.** On ne l'applique pas à tous les titres, car « McDonald's » ou « iPhone » seraient abîmés. On combine donc `str_detect()` et `str_to_title()` : seuls les textes **sans aucune minuscule** (motif `^[^a-z]+$`) sont convertis. La même règle s'applique aux artistes.
+
+```{r}
+#| label: fonction-4
+etape4 <- etape3 |>
+  mutate(
+    titre_propre = if_else(
+      str_detect(titre_base, "^[^a-z]+$"),
+      str_to_title(titre_base),
+      titre_base
+    ),
+    artiste_propre = str_squish(artiste),
+    artiste_propre = if_else(
+      str_detect(artiste_propre, "^[^A-Z]+$"),
+      str_to_title(artiste_propre),
+      artiste_propre
+    )
+  )
+
+etape4 |>
+  filter(titre_propre != titre_base) |>
+  select(titre_base, titre_propre) |>
+  slice_head(n = 6) |>
+  kable()
+```
+
+Une règle de casse reste une approximation : un sigle comme « TQG » deviendrait « Tqg ». Le résultat doit donc être vérifié.
+
+## 3. Résultats
+
+### Base finale
+
+Deux lignes décrivent la même chanson si l'artiste et le titre propre sont identiques, sans égard à la casse.
+
+```{r}
+#| label: base-finale
+base_chansons <- etape4 |>
+  mutate(cle = str_c(str_to_lower(artiste_propre), " | ", str_to_lower(titre_propre))) |>
+  distinct(cle, .keep_all = TRUE) |>
+  select(
+    titre = titre_propre,
+    artiste = artiste_propre,
+    album,
+    annee_remaster,
+    invite,
+    decennie,
+    est_remaster,
+    est_remix,
+    est_collab
+  )
+
+tibble(
+  lignes_brutes = nrow(brut),
+  chansons_distinctes = nrow(base_chansons)
+) |>
+  kable()
+```
+
+Le nombre de chansons distinctes doit être proche de 929, le nombre obtenu sur l'export original : les 25 doublons ajoutés devraient être retrouvés.
+
+### Doublons repérés
+
+```{r}
+#| label: doublons
+etape4 |>
+  mutate(cle = str_c(str_to_lower(artiste_propre), " | ", str_to_lower(titre_propre))) |>
+  group_by(cle) |>
+  filter(n() > 1) |>
+  ungroup() |>
+  arrange(artiste_propre, titre_propre) |>
+  select(artiste_propre, titre, titre_propre) |>
+  slice_head(n = 10) |>
+  kable()
+```
+
+### Répartition par décennie
+
+```{r}
+#| label: graphique-decennie
+base_chansons |>
+  filter(!is.na(decennie)) |>
+  count(decennie) |>
+  ggplot(aes(x = decennie, y = n)) +
+  geom_col(fill = "#2a6f97") +
+  labs(
+    x = "Décennie (estimée avec l'ISRC)",
+    y = "Chansons distinctes",
+    title = "Répartition de la bande sonore par décennie"
+  ) +
+  theme_minimal()
+```
+
+L'époque est estimée à partir de l'année d'attribution de l'ISRC. Un titre ancien réédité peut donc être classé dans une décennie récente : la répartition décrit les codes ISRC, pas nécessairement les dates de sortie.
+
+### Qui revient le plus souvent?
+
+```{r}
+#| label: artistes-frequents
+base_chansons |>
+  count(artiste, name = "chansons", sort = TRUE) |>
+  slice_head(n = 5) |>
+  kable()
+```
+
+## 4. Conclusion
+
+Avec quatre fonctions de `stringr`, une liste de titres désordonnée devient une table sur laquelle on peut raisonner :
+
+- les titres sont nettoyés et ramenés à leur forme de base (`str_replace_all()`);
+- les versions et les collaborations sont repérées (`str_detect()`);
+- l'invité, l'année de réédition et l'époque sont extraits (`str_extract()`);
+- la casse est uniformisée là où c'est nécessaire (`str_to_title()`).
+
+Le paquetage permet ainsi de compter les chansons réellement distinctes et de décrire l'époque de la bande sonore. Les règles restent des approximations (« tout ce qui suit un tiret est un suffixe », « feat » détecté dans n'importe quelle parenthèse) et doivent être validées sur les résultats.
